@@ -500,9 +500,10 @@ struct rbd_ctx {
 	rbd_image_t image;	/* image handle */
 	const char *krbd_name;	/* image /dev/rbd<id> name */ /* reused for nbd test */
 	int krbd_fd;		/* image /dev/rbd<id> fd */ /* reused for nbd test */
+	bool skip_partial_discard; /* rbd_skip_partial_discard option is enabled */
 };
 
-#define RBD_CTX_INIT	(struct rbd_ctx) { NULL, NULL, NULL, -1 }
+#define RBD_CTX_INIT	(struct rbd_ctx) { NULL, NULL, NULL, -1, false }
 
 struct rbd_operations {
 	int (*open)(const char *name, struct rbd_ctx *ctx);
@@ -534,10 +535,19 @@ int
 __librbd_open(const char *name, struct rbd_ctx *ctx)
 {
 	rbd_image_t image;
+	char buf[32];
 	int ret;
 
 	assert(!ctx->name && !ctx->image &&
-	       !ctx->krbd_name && ctx->krbd_fd < 0);
+	       !ctx->krbd_name && ctx->krbd_fd < 0 &&
+	       !ctx->skip_partial_discard);
+
+	ret = rados_conf_get(cluster, "rbd_skip_partial_discard", buf,
+			     sizeof(buf));
+	if (ret < 0) {
+		prt("rados_conf_get(rbd_skip_partial_discard) failed\n");
+		return ret;
+	}
 
 	ret = rbd_open(ioctx, name, &image, NULL);
 	if (ret < 0) {
@@ -549,6 +559,7 @@ __librbd_open(const char *name, struct rbd_ctx *ctx)
 	ctx->image = image;
 	ctx->krbd_name = NULL;
 	ctx->krbd_fd = -1;
+	ctx->skip_partial_discard = (strcmp(buf, "true") == 0);
 
 	return 0;
 }
@@ -576,6 +587,7 @@ __librbd_close(struct rbd_ctx *ctx)
 
 	ctx->name = NULL;
 	ctx->image = NULL;
+	ctx->skip_partial_discard = false;
 
 	return 0;
 }
@@ -1354,10 +1366,25 @@ report_failure(int status)
 #define short_at(cp) ((unsigned short)((*((unsigned char *)(cp)) << 8) | \
 				        *(((unsigned char *)(cp)) + 1)))
 
+int
+fsxcmp(char *good_buf, char *temp_buf, unsigned size)
+{
+	if (!ctx.skip_partial_discard) {
+		return memcmp(good_buf, temp_buf, size);
+	}
+
+	for (unsigned i = 0; i < size; i++) {
+		if (good_buf[i] != temp_buf[i] && good_buf[i] != 0) {
+			return good_buf[i] - temp_buf[i];
+		}
+	}
+	return 0;
+}
+
 void
 check_buffers(char *good_buf, char *temp_buf, unsigned offset, unsigned size)
 {
-	if (memcmp(good_buf + offset, temp_buf, size) != 0) {
+	if (fsxcmp(good_buf + offset, temp_buf, size) != 0) {
 		unsigned i = 0;
 		unsigned n = 0;
 
